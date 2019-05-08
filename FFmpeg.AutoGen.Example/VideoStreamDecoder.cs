@@ -17,45 +17,64 @@ namespace FFmpeg.AutoGen.Example
 
         private readonly AVStream* pStream = null;
 
-        public VideoStreamDecoder(string url)
+        private VideoStreamDecoder(AVFormatContext* pFormatContext)
         {
-            _pFormatContext = ffmpeg.avformat_alloc_context();
-
-            var pFormatContext = _pFormatContext;
-            ffmpeg.avformat_open_input(&pFormatContext, url, null, null).ThrowExceptionIfError();
-
-            ffmpeg.avformat_find_stream_info(_pFormatContext, null).ThrowExceptionIfError();
-
-            // find the first video stream
-            for (var i = 0; i < _pFormatContext->nb_streams; i++)
+            _pFormatContext = pFormatContext;
+            try
             {
-                var avStream = _pFormatContext->streams[i];
-                if (pStream == null && avStream->codec->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
+                ffmpeg.avformat_find_stream_info(_pFormatContext, null).ThrowExceptionIfError();
+
+                // find the first video stream
+                for (var i = 0; i < _pFormatContext->nb_streams; i++)
                 {
-                    pStream = avStream;
-                    Console.Write("using");
+                    var avStream = _pFormatContext->streams[i];
+                    if (pStream == null && avStream->codec->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
+                    {
+                        pStream = avStream;
+                        Console.Write("using ");
+                    }
+
+                    OutputDictionary(avStream->metadata, $"stream-{i}: {avStream->codec->codec_type} {(double)avStream->time_base.den / avStream->time_base.num:n3}");
                 }
 
-                OutputDictionary(avStream->metadata, $"stream-{i}: {avStream->codec->codec_type} {(double)avStream->time_base.den / avStream->time_base.num:n3}");
+                if (pStream == null) throw new InvalidOperationException("Could not found video stream.");
+
+                _streamIndex = pStream->index;
+                _pCodecContext = pStream->codec;
+
+                var codecId = _pCodecContext->codec_id;
+                var pCodec = ffmpeg.avcodec_find_decoder(codecId);
+                if (pCodec == null) throw new InvalidOperationException("Unsupported codec.");
+
+                ffmpeg.avcodec_open2(_pCodecContext, pCodec, null).ThrowExceptionIfError();
+
+                CodecName = ffmpeg.avcodec_get_name(codecId);
+                FrameSize = new Size(_pCodecContext->width, _pCodecContext->height);
+                PixelFormat = _pCodecContext->pix_fmt;
+
+                _pPacket = ffmpeg.av_packet_alloc();
+                _pFrame = ffmpeg.av_frame_alloc();
+            }
+            catch
+            {
+                this.Dispose();
+                throw;
+            }
+        }
+
+        public static VideoStreamDecoder TryCreate(string url, out string errorMessage)
+        {
+            var pFormatContext = ffmpeg.avformat_alloc_context();
+            var error = ffmpeg.avformat_open_input(&pFormatContext, url, null, null);
+            if (error < 0)
+            {
+                ffmpeg.avformat_free_context(pFormatContext);
+                errorMessage = FFmpegHelper.av_strerror(error);
+                return null;
             }
 
-            if (pStream == null) throw new InvalidOperationException("Could not found video stream.");
-
-            _streamIndex = pStream->index;
-            _pCodecContext = pStream->codec;
-
-            var codecId = _pCodecContext->codec_id;
-            var pCodec = ffmpeg.avcodec_find_decoder(codecId);
-            if (pCodec == null) throw new InvalidOperationException("Unsupported codec.");
-
-            ffmpeg.avcodec_open2(_pCodecContext, pCodec, null).ThrowExceptionIfError();
-
-            CodecName = ffmpeg.avcodec_get_name(codecId);
-            FrameSize = new Size(_pCodecContext->width, _pCodecContext->height);
-            PixelFormat = _pCodecContext->pix_fmt;
-
-            _pPacket = ffmpeg.av_packet_alloc();
-            _pFrame = ffmpeg.av_frame_alloc();
+            errorMessage = null;
+            return new VideoStreamDecoder(pFormatContext);
         }
 
         public string CodecName { get; }
@@ -64,15 +83,24 @@ namespace FFmpeg.AutoGen.Example
 
         public void Dispose()
         {
-            ffmpeg.av_frame_unref(_pFrame);
-            ffmpeg.av_free(_pFrame);
+            if (_pFrame != null)
+            {
+                ffmpeg.av_frame_unref(_pFrame);
+                ffmpeg.av_free(_pFrame);
+            }
 
-            ffmpeg.av_packet_unref(_pPacket);
-            ffmpeg.av_free(_pPacket);
+            if (_pPacket != null)
+            {
+                ffmpeg.av_packet_unref(_pPacket);
+                ffmpeg.av_free(_pPacket);
+            }
 
-            ffmpeg.avcodec_close(_pCodecContext);
+            if (_pCodecContext != null)
+                ffmpeg.avcodec_close(_pCodecContext);
+
             var pFormatContext = _pFormatContext;
-            ffmpeg.avformat_close_input(&pFormatContext);
+            if (pFormatContext != null)
+                ffmpeg.avformat_close_input(&pFormatContext);
         }
 
         public TimeSpan? GetTime(long value)

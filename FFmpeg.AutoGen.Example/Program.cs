@@ -8,8 +8,7 @@
     using System.Runtime.InteropServices;
     using System.Threading;
     using System.Threading.Tasks;
-    using System.Windows.Media;
-    using System.Windows.Media.Imaging;
+
 
     internal class Program
     {
@@ -26,12 +25,21 @@
 
             SetupLogging();
 
+            var urls = Directory.GetFiles(@"R:\xxx", "*", SearchOption.AllDirectories);
+
             Console.WriteLine("Decoding...");
-            Parallel.For(0, 1, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-                i =>
+            Parallel.ForEach(urls, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                url =>
                 {
                     //while (true)
-                    DecodeAllFramesToImages(i);
+                    try
+                    {
+                        DecodeAllFramesToImages(url);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(url + " failed: " + ex.Message);
+                    }
                 });
 
             return;
@@ -64,7 +72,7 @@
 
         private static unsafe void SetupLogging()
         {
-            ffmpeg.av_log_set_level(ffmpeg.AV_LOG_VERBOSE);
+            ffmpeg.av_log_set_level(ffmpeg.AV_LOG_INFO);
 
             // do not convert to local function
             av_log_set_callback_callback logCallback = (p0, level, format, vl) =>
@@ -75,7 +83,7 @@
                 var lineBuffer = stackalloc byte[lineSize];
                 var printPrefix = 1;
                 ffmpeg.av_log_format_line(p0, level, format, vl, lineBuffer, lineSize, &printPrefix);
-                var line = Marshal.PtrToStringAnsi((IntPtr) lineBuffer);
+                var line = Marshal.PtrToStringAnsi((IntPtr)lineBuffer);
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.Write("0x{0:x2} ({1}) ", level, (LogLevel)level);
                 Console.Write(line);
@@ -85,12 +93,21 @@
             ffmpeg.av_log_set_callback(logCallback);
         }
 
-        private static unsafe void DecodeAllFramesToImages(int loop)
+        private static VideoStreamDecoder TryGetDecoder(string url)
         {
-            // decode all frames from url, please not it might local resorce, e.g. string url = "../../sample_mpeg4.mp4";
-            var url = "http://www.quirksmode.org/html5/videos/big_buck_bunny.mp4"; // be advised this file holds 1440 frames
-            using (var vsd = new VideoStreamDecoder(url))
+            Console.WriteLine("probing: " + url);
+            var result = VideoStreamDecoder.TryCreate(url, out var errorMessage);
+            if (result == null)
+                Console.WriteLine(url + ": " + errorMessage);
+            return result;
+        }
+
+        private static unsafe void DecodeAllFramesToImages(string url)
+        {
+            using (var vsd = TryGetDecoder(url))
             {
+                if (vsd == null || vsd.CodecName == "ansi")
+                    return;
                 Console.WriteLine($"codec name: {vsd.CodecName}");
 
                 vsd.OutputDictionary();
@@ -102,35 +119,43 @@
                 using (var vfc = new VideoFrameConverter(sourceSize, sourcePixelFormat, destinationSize, destinationPixelFormat))
                 {
                     var frameNumber = 1;
-                    while (vsd.TryDecodeNextFrame(out var frame) /*&& frameNumber < 100*/)
+                    while (vsd.TryDecodeNextFrame(out var frame) /*&& frameNumber < 10*/)
                     {
                         if (frame.metadata != null)
                             VideoStreamDecoder.OutputDictionary(frame.metadata, "frame " + frameNumber);
 
-                        var filename = $"frame.{frameNumber:D8}.{loop}.jpg";
+                        var total = Interlocked.Increment(ref counter);
+                        var filename = $"fr.{total}.{frameNumber:D8}.jpg";
+                        if (total % 1000 == 0)
+                        {
+                            Console.WriteLine("{0:n1}k frames; {1:n0} bytes", total / 1000.0, GC.GetTotalMemory(true));
 
-                        vfc.Convert(in frame, out var convertedFrame);
-                        var buffer = (IntPtr)convertedFrame.data[0];
-                        var stride = convertedFrame.linesize[0];
+                            vfc.Convert(in frame, out var convertedFrame);
+                            var buffer = (IntPtr)convertedFrame.data[0];
+                            var stride = convertedFrame.linesize[0];
+                            using (var bitmap = new Bitmap(width: convertedFrame.width, height: convertedFrame.height, stride: stride, format: PixelFormat.Format32bppArgb, scan0: buffer))
+                                bitmap.Save(filename, ImageFormat.Jpeg);
+                            Console.WriteLine($"{url}{filename} R{frame.repeat_pict}x  {frame.pict_type}  bet:{frame.best_effort_timestamp}  {vsd.GetTime(frame.best_effort_timestamp)}  dts:{frame.pkt_dts}  pts:{frame.pts}  pktpts:{frame.pkt_pts}");
+                        }
+
+                        //vfc.Convert(in frame, out var convertedFrame);
+                        //var buffer = (IntPtr)convertedFrame.data[0];
+                        //var stride = convertedFrame.linesize[0];
 
                         //using (var bitmap = new Bitmap(width: convertedFrame.width, height: convertedFrame.height, stride: stride, format: PixelFormat.Format32bppArgb, scan0: buffer))
                         //    bitmap.Save(filename, ImageFormat.Jpeg);
 
-                        var source = BitmapSource.Create(convertedFrame.width, convertedFrame.height, 96, 96, PixelFormats.Bgra32, null, buffer, stride * convertedFrame.height, stride);
-                        var bf = BitmapFrame.Create(source);
-                        var encoder = new JpegBitmapEncoder() { QualityLevel = 50 };
-                        encoder.Frames.Add(bf);
-                        using (var stream = File.Create(filename))
-                        {
-                            encoder.Save(stream);
-                        }
+                        //var source = BitmapSource.Create(convertedFrame.width, convertedFrame.height, 96, 96, PixelFormats.Bgra32, null, buffer, stride * convertedFrame.height, stride);
+                        //var bf = BitmapFrame.Create(source);
+                        //var encoder = new JpegBitmapEncoder() { QualityLevel = 50 };
+                        //encoder.Frames.Add(bf);
+                        //using (var stream = File.Create(filename))
+                        //{
+                        //    encoder.Save(stream);
+                        //}
 
-                        Console.WriteLine($"{filename} R{frame.repeat_pict}x  {frame.pict_type}  bet:{frame.best_effort_timestamp}  {vsd.GetTime(frame.best_effort_timestamp)}  dts:{frame.pkt_dts}  pts:{frame.pts}  pktpts:{frame.pkt_pts}");
+                        //Console.WriteLine($"{url}{filename} R{frame.repeat_pict}x  {frame.pict_type}  bet:{frame.best_effort_timestamp}  {vsd.GetTime(frame.best_effort_timestamp)}  dts:{frame.pkt_dts}  pts:{frame.pts}  pktpts:{frame.pkt_pts}");
                         frameNumber++;
-
-                        var total = Interlocked.Increment(ref counter);
-                        if (total % 1000 == 0)
-                            Console.WriteLine("{0:n1}k frames; {1:n0} bytes", total / 1000.0, GC.GetTotalMemory(true));
                     }
                 }
             }
@@ -189,7 +214,7 @@
 
         private static byte[] GetBitmapData(Bitmap frameBitmap)
         {
-            var bitmapData = frameBitmap.LockBits(new Rectangle(Point.Empty, frameBitmap.Size), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+            var bitmapData = frameBitmap.LockBits(new Rectangle(Point.Empty, frameBitmap.Size), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
             try
             {
                 var length = bitmapData.Stride * bitmapData.Height;
