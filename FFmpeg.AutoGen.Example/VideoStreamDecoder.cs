@@ -5,6 +5,8 @@ using System.Runtime.InteropServices;
 
 namespace FFmpeg.AutoGen.Example
 {
+    using System.Linq;
+
     public sealed unsafe class VideoStreamDecoder : IDisposable
     {
         private readonly AVCodecContext* _pCodecContext;
@@ -12,6 +14,8 @@ namespace FFmpeg.AutoGen.Example
         private readonly int _streamIndex;
         private readonly AVFrame* _pFrame;
         private readonly AVPacket* _pPacket;
+
+        private readonly AVStream* pStream = null;
 
         public VideoStreamDecoder(string url)
         {
@@ -23,13 +27,17 @@ namespace FFmpeg.AutoGen.Example
             ffmpeg.avformat_find_stream_info(_pFormatContext, null).ThrowExceptionIfError();
 
             // find the first video stream
-            AVStream* pStream = null;
             for (var i = 0; i < _pFormatContext->nb_streams; i++)
-                if (_pFormatContext->streams[i]->codec->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
+            {
+                var avStream = _pFormatContext->streams[i];
+                if (pStream == null && avStream->codec->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
                 {
-                    pStream = _pFormatContext->streams[i];
-                    break;
+                    pStream = avStream;
+                    Console.Write("using");
                 }
+
+                OutputDictionary(avStream->metadata, $"stream-{i}: {avStream->codec->codec_type} {(double)avStream->time_base.den / avStream->time_base.num:n3}");
+            }
 
             if (pStream == null) throw new InvalidOperationException("Could not found video stream.");
 
@@ -67,27 +75,56 @@ namespace FFmpeg.AutoGen.Example
             ffmpeg.avformat_close_input(&pFormatContext);
         }
 
+        public TimeSpan? GetTime(long value)
+        {
+            if (value == long.MinValue)
+                return null;
+            var sec = (double)value * this.pStream->time_base.num / this.pStream->time_base.den;
+            return TimeSpan.FromSeconds(sec);
+        }
+
         public bool TryDecodeNextFrame(out AVFrame frame)
         {
             ffmpeg.av_frame_unref(_pFrame);
             int error;
+
+            error = ffmpeg.avcodec_receive_frame(_pCodecContext, _pFrame);
+            if (error != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+            {
+                frame = *_pFrame;
+                if (error == ffmpeg.AVERROR_EOF)
+                    return false;
+
+                error.ThrowExceptionIfError();
+                return true;
+            }
+
             do
             {
                 try
                 {
-                    do
+                    while (true)
                     {
                         error = ffmpeg.av_read_frame(_pFormatContext, _pPacket);
                         if (error == ffmpeg.AVERROR_EOF)
                         {
-                            frame = *_pFrame;
-                            return false;
+                            // trigger draining/flushing
+                            ffmpeg.avcodec_send_packet(_pCodecContext, null).ThrowExceptionIfError();
+                            break;
+                            //frame = *_pFrame;
+                            //return false;
                         }
 
                         error.ThrowExceptionIfError();
-                    } while (_pPacket->stream_index != _streamIndex);
 
-                    ffmpeg.avcodec_send_packet(_pCodecContext, _pPacket).ThrowExceptionIfError();
+                        if (_pPacket->stream_index == _streamIndex)
+                        {
+                            ffmpeg.avcodec_send_packet(_pCodecContext, _pPacket).ThrowExceptionIfError();
+                            break;
+                        }
+
+                        ffmpeg.av_packet_unref(_pPacket);
+                    }
                 }
                 finally
                 {
@@ -97,19 +134,34 @@ namespace FFmpeg.AutoGen.Example
                 error = ffmpeg.avcodec_receive_frame(_pCodecContext, _pFrame);
             } while (error == ffmpeg.AVERROR(ffmpeg.EAGAIN));
 
-            error.ThrowExceptionIfError();
             frame = *_pFrame;
+            if (error == ffmpeg.AVERROR_EOF)
+                return false;
+
+            error.ThrowExceptionIfError();
             return true;
         }
 
-        public IReadOnlyDictionary<string, string> GetContextInfo()
+        public void OutputDictionary()
+            => OutputDictionary(_pFormatContext->metadata, "CONTEXT (file)");
+
+        public static void OutputDictionary(AVDictionary* dict, string title)
+        {
+            var info = GetDictionary(dict);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine(title);
+            Console.ResetColor();
+            info.ToList().ForEach(x => Console.WriteLine($"{x.Key} = {x.Value}"));
+        }
+
+        private static IReadOnlyDictionary<string, string> GetDictionary(AVDictionary* dict)
         {
             AVDictionaryEntry* tag = null;
             var result = new Dictionary<string, string>();
-            while ((tag = ffmpeg.av_dict_get(_pFormatContext->metadata, "", tag, ffmpeg.AV_DICT_IGNORE_SUFFIX)) != null)
+            while ((tag = ffmpeg.av_dict_get(dict, "", tag, ffmpeg.AV_DICT_IGNORE_SUFFIX)) != null)
             {
-                var key = Marshal.PtrToStringAnsi((IntPtr) tag->key);
-                var value = Marshal.PtrToStringAnsi((IntPtr) tag->value);
+                var key = Marshal.PtrToStringAnsi((IntPtr)tag->key);
+                var value = Marshal.PtrToStringAnsi((IntPtr)tag->value);
                 result.Add(key, value);
             }
 

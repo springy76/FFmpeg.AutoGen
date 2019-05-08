@@ -37,7 +37,7 @@ namespace FFmpeg.AutoGen.Example
             ffmpeg.sws_freeContext(_pConvertContext);
         }
 
-        public AVFrame Convert(AVFrame sourceFrame)
+        public void Convert(in AVFrame sourceFrame, out AVFrame targetFrame)
         {
             ffmpeg.sws_scale(_pConvertContext, sourceFrame.data, sourceFrame.linesize, 0, sourceFrame.height, _dstData, _dstLinesize);
 
@@ -46,7 +46,7 @@ namespace FFmpeg.AutoGen.Example
             var linesize = new int_array8();
             linesize.UpdateFrom(_dstLinesize);
 
-            return new AVFrame
+            targetFrame = new AVFrame
             {
                 data = data,
                 linesize = linesize,

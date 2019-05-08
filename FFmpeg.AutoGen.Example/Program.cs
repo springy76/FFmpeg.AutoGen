@@ -1,30 +1,65 @@
-﻿using System;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices;
-
-namespace FFmpeg.AutoGen.Example
+﻿namespace FFmpeg.AutoGen.Example
 {
+    using System;
+    using System.Drawing;
+    using System.Drawing.Imaging;
+    using System.IO;
+    using System.Linq;
+    using System.Runtime.InteropServices;
+    using System.Threading;
+    using System.Threading.Tasks;
+    using System.Windows.Media;
+    using System.Windows.Media.Imaging;
+
     internal class Program
     {
+        private static int counter;
+
         private static void Main(string[] args)
         {
             Console.WriteLine("Current directory: " + Environment.CurrentDirectory);
             Console.WriteLine("Runnung in {0}-bit mode.", Environment.Is64BitProcess ? "64" : "32");
 
             FFmpegBinariesHelper.RegisterFFmpegBinaries();
-            
+
             Console.WriteLine($"FFmpeg version info: {ffmpeg.av_version_info()}");
-            
+
             SetupLogging();
 
             Console.WriteLine("Decoding...");
-            DecodeAllFramesToImages();
+            Parallel.For(0, 1, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                i =>
+                {
+                    //while (true)
+                    DecodeAllFramesToImages(i);
+                });
 
+            return;
             Console.WriteLine("Encoding...");
             EncodeImagesToH264();
+        }
+
+        [Flags]
+        /*
+        /// <summary>AV_LOG_PANIC = 0</summary>
+        /// <summary>AV_LOG_FATAL = 8</summary>
+        /// <summary>AV_LOG_ERROR = 16</summary>
+        /// <summary>AV_LOG_WARNING = 24</summary>
+        /// <summary>AV_LOG_INFO = 32</summary>
+        /// <summary>AV_LOG_VERBOSE = 40</summary>
+        /// <summary>AV_LOG_DEBUG = 48</summary>
+        /// <summary>AV_LOG_TRACE = 56</summary>
+*/
+        private enum LogLevel
+        {
+            Panic = 0,
+            Fatal = 8,
+            Error = 16,
+            Warning = 24,
+            Info = 32,
+            Verbose = 40,
+            Debug = 48,
+            Trace = 56,
         }
 
         private static unsafe void SetupLogging()
@@ -42,6 +77,7 @@ namespace FFmpeg.AutoGen.Example
                 ffmpeg.av_log_format_line(p0, level, format, vl, lineBuffer, lineSize, &printPrefix);
                 var line = Marshal.PtrToStringAnsi((IntPtr) lineBuffer);
                 Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write("0x{0:x2} ({1}) ", level, (LogLevel)level);
                 Console.Write(line);
                 Console.ResetColor();
             };
@@ -49,7 +85,7 @@ namespace FFmpeg.AutoGen.Example
             ffmpeg.av_log_set_callback(logCallback);
         }
 
-        private static unsafe void DecodeAllFramesToImages()
+        private static unsafe void DecodeAllFramesToImages(int loop)
         {
             // decode all frames from url, please not it might local resorce, e.g. string url = "../../sample_mpeg4.mp4";
             var url = "http://www.quirksmode.org/html5/videos/big_buck_bunny.mp4"; // be advised this file holds 1440 frames
@@ -57,25 +93,44 @@ namespace FFmpeg.AutoGen.Example
             {
                 Console.WriteLine($"codec name: {vsd.CodecName}");
 
-                var info = vsd.GetContextInfo();
-                info.ToList().ForEach(x => Console.WriteLine($"{x.Key} = {x.Value}"));
+                vsd.OutputDictionary();
 
                 var sourceSize = vsd.FrameSize;
                 var sourcePixelFormat = vsd.PixelFormat;
                 var destinationSize = sourceSize;
-                var destinationPixelFormat = AVPixelFormat.AV_PIX_FMT_BGR24;
+                var destinationPixelFormat = AVPixelFormat.AV_PIX_FMT_BGRA;
                 using (var vfc = new VideoFrameConverter(sourceSize, sourcePixelFormat, destinationSize, destinationPixelFormat))
                 {
-                    var frameNumber = 0;
-                    while (vsd.TryDecodeNextFrame(out var frame))
+                    var frameNumber = 1;
+                    while (vsd.TryDecodeNextFrame(out var frame) /*&& frameNumber < 100*/)
                     {
-                        var convertedFrame = vfc.Convert(frame);
+                        if (frame.metadata != null)
+                            VideoStreamDecoder.OutputDictionary(frame.metadata, "frame " + frameNumber);
 
-                        using (var bitmap = new Bitmap(convertedFrame.width, convertedFrame.height, convertedFrame.linesize[0], PixelFormat.Format24bppRgb, (IntPtr) convertedFrame.data[0]))
-                            bitmap.Save($"frame.{frameNumber:D8}.jpg", ImageFormat.Jpeg);
-                        
-                        Console.WriteLine($"frame: {frameNumber}");
+                        var filename = $"frame.{frameNumber:D8}.{loop}.jpg";
+
+                        vfc.Convert(in frame, out var convertedFrame);
+                        var buffer = (IntPtr)convertedFrame.data[0];
+                        var stride = convertedFrame.linesize[0];
+
+                        //using (var bitmap = new Bitmap(width: convertedFrame.width, height: convertedFrame.height, stride: stride, format: PixelFormat.Format32bppArgb, scan0: buffer))
+                        //    bitmap.Save(filename, ImageFormat.Jpeg);
+
+                        var source = BitmapSource.Create(convertedFrame.width, convertedFrame.height, 96, 96, PixelFormats.Bgra32, null, buffer, stride * convertedFrame.height, stride);
+                        var bf = BitmapFrame.Create(source);
+                        var encoder = new JpegBitmapEncoder() { QualityLevel = 50 };
+                        encoder.Frames.Add(bf);
+                        using (var stream = File.Create(filename))
+                        {
+                            encoder.Save(stream);
+                        }
+
+                        Console.WriteLine($"{filename} R{frame.repeat_pict}x  {frame.pict_type}  bet:{frame.best_effort_timestamp}  {vsd.GetTime(frame.best_effort_timestamp)}  dts:{frame.pkt_dts}  pts:{frame.pts}  pktpts:{frame.pkt_pts}");
                         frameNumber++;
+
+                        var total = Interlocked.Increment(ref counter);
+                        if (total % 1000 == 0)
+                            Console.WriteLine("{0:n1}k frames; {1:n0} bytes", total / 1000.0, GC.GetTotalMemory(true));
                     }
                 }
             }
@@ -108,7 +163,7 @@ namespace FFmpeg.AutoGen.Example
                             {
                                 bitmapData = GetBitmapData(frameBitmap);
                             }
-                    
+
                             fixed (byte* pBitmapData = bitmapData)
                             {
                                 var data = new byte_ptrArray8 { [0] = pBitmapData };
@@ -119,7 +174,7 @@ namespace FFmpeg.AutoGen.Example
                                     linesize = linesize,
                                     height = sourceSize.Height
                                 };
-                                var convertedFrame = vfc.Convert(frame);
+                                vfc.Convert(in frame, out var convertedFrame);
                                 convertedFrame.pts = frameNumber * fps;
                                 vse.Encode(convertedFrame);
                             }
