@@ -15,6 +15,8 @@ namespace FFmpeg.AutoGen.Example
         public VideoFrameConverter(Size sourceSize, AVPixelFormat sourcePixelFormat,
             Size destinationSize, AVPixelFormat destinationPixelFormat)
         {
+            if (sourceSize.Width == 0 || sourceSize.Height == 0 || sourcePixelFormat == AVPixelFormat.AV_PIX_FMT_NONE)
+                throw new InvalidOperationException($"Invalid source: {sourceSize} [{sourcePixelFormat}]");
             _destinationSize = destinationSize;
          
                 _pConvertContext = ffmpeg.sws_getContext(sourceSize.Width, sourceSize.Height, sourcePixelFormat,
